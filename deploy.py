@@ -33,6 +33,10 @@ def required(name: str) -> str:
     return value
 
 
+def csv_env(name: str) -> list[str]:
+    return [value.strip() for value in os.getenv(name, "").split(",") if value.strip()]
+
+
 REGION = os.getenv("AWS_REGION", "us-east-2").strip()
 IMAGE_URI = required("IMAGE_URI")
 OPERATOR_ROLE_ARN = required("CAPACITY_PROVIDER_OPERATOR_ROLE_ARN")
@@ -51,12 +55,32 @@ PROVIDER_IDLE_TIMEOUT = int(os.getenv("PROVIDER_IDLE_TIMEOUT", "900"))
 RUNTIME_MAX_LIFETIME = int(os.getenv("RUNTIME_MAX_LIFETIME", "1800"))
 RUNTIME_IDLE_TIMEOUT = int(os.getenv("RUNTIME_IDLE_TIMEOUT", "300"))
 DRIVE9_SERVER = os.getenv("DRIVE9_SERVER", "https://api.drive9.ai").rstrip("/")
+DRIVE9_SHARED_BASE_REMOTE = os.getenv(
+    "DRIVE9_SHARED_BASE_REMOTE", f":/agentcore-tests/{TEST_RUN_ID}/shared"
+).rstrip("/")
+DRIVE9_AGENT_C_BASE_REMOTE = os.getenv(
+    "DRIVE9_AGENT_C_BASE_REMOTE", f":/agentcore-tests/{TEST_RUN_ID}/agent-c"
+).rstrip("/")
 SECRET_PREFIX = os.getenv("DRIVE9_SECRET_PREFIX", "drive9/agentcore").rstrip("/")
 CONTROL_METHOD_REQUESTED = os.getenv("AGENTCORE_CONTROL_METHOD", "auto").strip().lower()
 AWS_CLI = os.getenv("AWS_CLI_BIN", "aws").strip() or "aws"
+AUTHZ_DISCOVERY_URL = required("AUTHZ_DISCOVERY_URL")
+AUTHZ_ALLOWED_AUDIENCES = csv_env("AUTHZ_ALLOWED_AUDIENCES")
+AUTHZ_ALLOWED_CLIENTS = csv_env("AUTHZ_ALLOWED_CLIENTS")
+AUTHZ_ALLOWED_JWT_ALGORITHMS = csv_env("AUTHZ_ALLOWED_JWT_ALGORITHMS") or ["RS256"]
+AUTHZ_READ_SCOPE = os.getenv("AUTHZ_READ_SCOPE", "drive9.read").strip()
+AUTHZ_WRITE_SCOPE = os.getenv("AUTHZ_WRITE_SCOPE", "drive9.write").strip()
+AUTHZ_OPERATOR_SCOPE = os.getenv("AUTHZ_OPERATOR_SCOPE", "drive9.operator").strip()
+AUTHZ_ADMIN_SCOPE = os.getenv("AUTHZ_ADMIN_SCOPE", "drive9.admin").strip()
+AUTHZ_ALLOWED_SCOPES = [
+    AUTHZ_READ_SCOPE,
+    AUTHZ_WRITE_SCOPE,
+    AUTHZ_OPERATOR_SCOPE,
+    AUTHZ_ADMIN_SCOPE,
+]
 
-if REGION != "us-east-2":
-    raise RuntimeError(f"AWS_REGION must be us-east-2, got {REGION!r}")
+if not re.fullmatch(r"[a-z]{2}-[a-z]+-\d", REGION):
+    raise RuntimeError(f"AWS_REGION is invalid: {REGION!r}")
 if OPERATING_SYSTEM != "LINUX_ARM64":
     raise RuntimeError("OPERATING_SYSTEM is fixed to LINUX_ARM64 for this project")
 if not SUBNETS or not SECURITY_GROUPS:
@@ -75,6 +99,26 @@ if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,47}", VOLUME_NAME):
     raise RuntimeError("CAPACITY_PROVIDER_VOLUME_NAME must be a valid AgentCore volume name")
 if CONTROL_METHOD_REQUESTED not in {"auto", "sdk", "cli"}:
     raise RuntimeError("AGENTCORE_CONTROL_METHOD must be auto, sdk, or cli")
+if not re.fullmatch(r"https://.+/\.well-known/openid-configuration", AUTHZ_DISCOVERY_URL):
+    raise RuntimeError(
+        "AUTHZ_DISCOVERY_URL must be an HTTPS OpenID Connect discovery URL ending in "
+        "'/.well-known/openid-configuration'"
+    )
+if not AUTHZ_ALLOWED_AUDIENCES and not AUTHZ_ALLOWED_CLIENTS:
+    raise RuntimeError("AUTHZ_ALLOWED_AUDIENCES or AUTHZ_ALLOWED_CLIENTS must be configured")
+if any(not re.fullmatch(r"[!-~]{1,256}", scope) for scope in AUTHZ_ALLOWED_SCOPES):
+    raise RuntimeError("authorization scopes must be non-empty printable ASCII without whitespace")
+if len(set(AUTHZ_ALLOWED_SCOPES)) != len(AUTHZ_ALLOWED_SCOPES):
+    raise RuntimeError("read, write, operator, and admin scopes must be distinct")
+if any(algorithm not in {"RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}
+       for algorithm in AUTHZ_ALLOWED_JWT_ALGORITHMS):
+    raise RuntimeError("AUTHZ_ALLOWED_JWT_ALGORITHMS contains an unsupported algorithm")
+for remote_path, variable in (
+    (DRIVE9_SHARED_BASE_REMOTE, "DRIVE9_SHARED_BASE_REMOTE"),
+    (DRIVE9_AGENT_C_BASE_REMOTE, "DRIVE9_AGENT_C_BASE_REMOTE"),
+):
+    if not remote_path.startswith(":/") or ".." in remote_path.split("/"):
+        raise RuntimeError(f"{variable} must be an absolute Drive9 path without '..'")
 
 
 def _sdk_client() -> Any | None:
@@ -179,6 +223,18 @@ def _secret_id(agent_id: str) -> str:
     return os.getenv(env_name, f"{SECRET_PREFIX}/{TEST_RUN_ID}-{agent_id}").strip()
 
 
+def _authorizer_configuration() -> dict[str, Any]:
+    custom_authorizer: dict[str, Any] = {
+        "discoveryUrl": AUTHZ_DISCOVERY_URL,
+        "allowedScopes": AUTHZ_ALLOWED_SCOPES,
+    }
+    if AUTHZ_ALLOWED_AUDIENCES:
+        custom_authorizer["allowedAudience"] = AUTHZ_ALLOWED_AUDIENCES
+    if AUTHZ_ALLOWED_CLIENTS:
+        custom_authorizer["allowedClients"] = AUTHZ_ALLOWED_CLIENTS
+    return {"customJWTAuthorizer": custom_authorizer}
+
+
 def _delete_runtime(runtime_id: str) -> None:
     try:
         _call("delete_agent_runtime", agentRuntimeId=runtime_id, clientToken=_client_token("delete-runtime"))
@@ -275,6 +331,8 @@ def main() -> None:
                 agentRuntimeName=runtime_name,
                 description=f"Drive9 validation runtime for {agent_id}",
                 roleArn=RUNTIME_ROLE_ARN,
+                authorizerConfiguration=_authorizer_configuration(),
+                requestHeaderConfiguration={"requestHeaderAllowlist": ["Authorization"]},
                 clientToken=_client_token(f"create-{agent_id}"),
                 agentRuntimeArtifact={
                     "containerConfiguration": {
@@ -301,8 +359,18 @@ def main() -> None:
                     "AGENT_ID": agent_id,
                     "DRIVE9_SECRET_ID": _secret_id(agent_id),
                     "DRIVE9_SERVER": DRIVE9_SERVER,
+                    "DRIVE9_SHARED_BASE_REMOTE": DRIVE9_SHARED_BASE_REMOTE,
+                    "DRIVE9_AGENT_C_BASE_REMOTE": DRIVE9_AGENT_C_BASE_REMOTE,
                     "EXPECTED_ARCHITECTURE": ARCHITECTURE,
                     "TEST_RUN_ID": TEST_RUN_ID,
+                    "AUTHZ_DISCOVERY_URL": AUTHZ_DISCOVERY_URL,
+                    "AUTHZ_ALLOWED_AUDIENCES": ",".join(AUTHZ_ALLOWED_AUDIENCES),
+                    "AUTHZ_ALLOWED_CLIENTS": ",".join(AUTHZ_ALLOWED_CLIENTS),
+                    "AUTHZ_ALLOWED_JWT_ALGORITHMS": ",".join(AUTHZ_ALLOWED_JWT_ALGORITHMS),
+                    "AUTHZ_READ_SCOPE": AUTHZ_READ_SCOPE,
+                    "AUTHZ_WRITE_SCOPE": AUTHZ_WRITE_SCOPE,
+                    "AUTHZ_OPERATOR_SCOPE": AUTHZ_OPERATOR_SCOPE,
+                    "AUTHZ_ADMIN_SCOPE": AUTHZ_ADMIN_SCOPE,
                 },
                 tags={
                     "Project": "Drive9AgentCoreTest",
@@ -327,7 +395,21 @@ def main() -> None:
             "instance_type": INSTANCE_TYPE,
             "image_uri": IMAGE_URI,
             "drive9_server": DRIVE9_SERVER,
+            "shared_base_remote": DRIVE9_SHARED_BASE_REMOTE,
+            "agent_c_base_remote": DRIVE9_AGENT_C_BASE_REMOTE,
             "test_run_id": TEST_RUN_ID,
+            "inbound_authorization": {
+                "type": "CUSTOM_JWT",
+                "discovery_url": AUTHZ_DISCOVERY_URL,
+                "allowed_audiences": AUTHZ_ALLOWED_AUDIENCES,
+                "allowed_clients": AUTHZ_ALLOWED_CLIENTS,
+                "action_scopes": {
+                    "read": AUTHZ_READ_SCOPE,
+                    "write": AUTHZ_WRITE_SCOPE,
+                    "operator": AUTHZ_OPERATOR_SCOPE,
+                    "admin": AUTHZ_ADMIN_SCOPE,
+                },
+            },
             "control_method": CONTROL_METHOD,
             "capacity_provider_id": capacity_provider_id,
             "capacity_provider_arn": capacity_provider_arn,

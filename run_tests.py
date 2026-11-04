@@ -23,7 +23,11 @@ def load_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Drive9 AgentCore regression tests.")
     parser.add_argument("--deployment", default="deployment.json")
     parser.add_argument("--output", default="artifacts")
-    parser.add_argument("--skip-mount", action="store_true", help="Skip FUSE and Git tests.")
+    parser.add_argument(
+        "--skip-mount",
+        action="store_true",
+        help="Skip only the optional FUSE mount test; safe local Git tests still run.",
+    )
     return parser.parse_args()
 
 
@@ -188,15 +192,12 @@ for index, (path, content) in enumerate(documents.items(), start=1):
 invoke("agent-b", sessions["agent-b"], {"action": "find", "path": "search", "name": "*.md"}, "SEARCH-001")
 invoke("agent-b", sessions["agent-b"], {"action": "search", "path": "search", "query": "how does the code recover from transient network failures"}, "SEARCH-002")
 
-# 7. FUSE and Git are optional because AgentCore may withhold /dev/fuse.
+# 7. FUSE is optional. Git runs unprivileged on tenant-local EBS and does not
+# consume repository metadata from the Drive9 mount, so it is independent of FUSE.
 if not args.skip_mount:
-    mount = invoke("agent-a", sessions["agent-a"], {"action": "mount_test"}, "FUSE-001")
-    if mount["status"] == "PASS":
-        invoke("agent-a", sessions["agent-a"], {"action": "git_prepare", "task_id": "git-001"}, "GIT-001")
-        invoke("agent-b", sessions["agent-b"], {"action": "git_verify", "task_id": "git-001"}, "GIT-002")
-    elif mount["status"] == "PLATFORM_BLOCKED":
-        for test_id, agent_id, action in (("GIT-001", "agent-a", "git_prepare"), ("GIT-002", "agent-b", "git_verify")):
-            results.append({"test_id": test_id, "agent_id": agent_id, "session_id": sessions[agent_id], "action": action, "started_at": time.time(), "finished_at": time.time(), "status": "PLATFORM_BLOCKED", "error": "Git skipped because mount_test was platform blocked", "response": {}})
+    invoke("agent-a", sessions["agent-a"], {"action": "mount_test"}, "FUSE-001")
+invoke("agent-a", sessions["agent-a"], {"action": "git_prepare", "task_id": "git-001"}, "GIT-001")
+invoke("agent-b", sessions["agent-b"], {"action": "git_verify", "task_id": "git-001"}, "GIT-002")
 
 # 8. Fresh session recovery proves Drive9 persistence independently.
 fresh_a_session = new_session("agent-a", "fresh-instance")
@@ -225,7 +226,7 @@ lines = [
     "## 结果汇总", "", "| Status | Count |", "|---|---:|",
 ]
 if args.skip_mount:
-    lines.insert(5, "- FUSE/Git tests: **SKIPPED** (`--skip-mount`)")
+    lines.insert(5, "- FUSE test: **SKIPPED** (`--skip-mount`); safe local Git tests still executed")
 for status, count in sorted(counts.items()):
     lines.append(f"| {status} | {count} |")
 lines.extend(["", "## 用例明细", "", "| Test ID | Agent | Action | Status |", "|---|---|---|---|"])

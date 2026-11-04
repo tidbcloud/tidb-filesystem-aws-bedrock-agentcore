@@ -9,8 +9,15 @@ import subprocess
 import shutil
 import tempfile
 import uuid
+import sys
 from pathlib import Path
 from typing import Any
+
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+
+from runtime_oauth_client import bearer_token, invoke_oauth
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -20,9 +27,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--agent", required=True, choices=("agent-a", "agent-b", "agent-c"))
     parser.add_argument(
         "--method",
-        choices=("auto", "sdk", "cli"),
-        default="auto",
-        help="AgentCore data-plane invocation method (default: auto).",
+        choices=("oauth", "sdk", "cli", "auto"),
+        default="oauth",
+        help="AgentCore invocation method; JWT-authorized deployments require oauth (default).",
     )
     parser.add_argument(
         "--session-id",
@@ -154,7 +161,15 @@ def main() -> None:
     payload = load_payload(args)
 
     method = args.method
-    if method in {"auto", "sdk"}:
+    if method == "oauth":
+        body = invoke_oauth(
+            region=deployment["region"],
+            runtime_arn=runtime["agent_runtime_arn"],
+            session_id=session_id,
+            payload=payload,
+            token=bearer_token(),
+        )
+    elif method in {"auto", "sdk"}:
         try:
             body = _invoke_sdk(deployment, runtime, session_id, payload)
             method = "sdk"
@@ -187,7 +202,7 @@ def main() -> None:
             default=str,
         )
     )
-    if not isinstance(body, dict) or body.get("status") == "FAIL":
+    if not isinstance(body, dict) or body.get("status") in {"FAIL", "DENIED"}:
         raise SystemExit(1)
 
 
