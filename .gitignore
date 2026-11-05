@@ -1,0 +1,43 @@
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# AWS credentials
+.aws/
+credentials
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+env/
+
+# Node.js
+node_modules/
+
+# Logs
+*.log
+logs/
+
+# IDE
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
+
+# Temporary files
+*.tmp
+*.swp
+*.bak
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+

@@ -19,7 +19,7 @@ Runtime 使用 AgentCore `customJWTAuthorizer` 校验 OIDC JWT，并在应用内
 
 部署层同样按 tenant 隔离：三个 Runtime 分别绑定独立 IAM execution role、独立 EBS scratch volume 和独立 Secrets Manager Secret。部署脚本会在调用 AWS 前拒绝任何重复绑定。
 
-Git 不再对 Drive9 上可被对等方修改的工作树或 `.git` 元数据执行命令。`git_prepare` 只在当前 tenant 的本地 EBS 临时目录中以 UID/GID 10001 运行 Git，并向 Drive9 发布普通 JSON 快照；`git_verify` 只按固定 schema 读取该快照，完全不执行 Git。普通文件 action 同时拒绝任何包含 `.git` 路径组件的请求。
+Git 不再对 Drive9 上可被对等方修改的工作树或 `.git` 元数据执行命令。`git_prepare` 只在当前 tenant 的本地 EBS 临时目录中以 UID/GID 10000 运行 Git，并向 Drive9 发布普通 JSON 快照；`git_verify` 只按固定 schema 读取该快照，完全不执行 Git。普通文件 action 同时拒绝任何包含 `.git` 路径组件的请求。
 
 ## 已验证结论
 

@@ -6,12 +6,14 @@ reasoning. All user-supplied paths are relative to the current test run root.
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import logging
 import os
 import platform
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -62,6 +64,21 @@ for remote_path, variable in (
     if not remote_path.startswith(":/") or ".." in PurePosixPath(remote_path[2:]).parts:
         raise RuntimeError(f"{variable} must be an absolute Drive9 path without '..'")
 MAX_RESPONSE_BYTES = int(os.getenv("MAX_RESPONSE_BYTES", "1048576"))
+
+# The Drive9 credential is only ever materialised as a 0600 context file in a
+# private tmpfs directory. It is never placed in a child-process environment
+# or command line, and it is re-read from Secrets Manager periodically so a
+# rotated Secret takes effect without restarting the runtime.
+DRIVE9_MEMORY_ROOT = Path("/dev/shm")
+DRIVE9_SECRET_REFRESH_SECONDS = int(os.getenv("DRIVE9_SECRET_REFRESH_SECONDS", "900"))
+if not 60 <= DRIVE9_SECRET_REFRESH_SECONDS <= 86400:
+    raise RuntimeError("DRIVE9_SECRET_REFRESH_SECONDS must be between 60 and 86400")
+_CHILD_PATH = "/usr/local/bin:/usr/bin:/bin"
+# Plaintext credential variables are not a supported input. Remove them so no
+# child process can inherit them, even one started with the default env.
+for _plaintext_credential in ("DRIVE9_API_KEY", "DRIVE9_TEST_TOKEN", "DRIVE9_VAULT_TOKEN"):
+    if os.environ.pop(_plaintext_credential, None) is not None:
+        LOGGER.warning("ignoring plaintext credential variable %s; use DRIVE9_SECRET_ID", _plaintext_credential)
 
 # AgentCore validates the same token at the service boundary. The application
 # verifies it again before using any claim for per-action authorization so a
@@ -114,6 +131,10 @@ _CONTEXT_READY = False
 _CONTEXT_NAME = ""
 _SECRET_TOKEN = ""
 _SECRET_SERVER = ""
+_SECRET_LOADED_AT = 0.0
+# Every token value seen by this process, so output is still redacted after
+# a rotation replaces _SECRET_TOKEN.
+_REDACTED_VALUES: set[str] = set()
 
 
 class AuthorizationError(Exception):
@@ -227,9 +248,25 @@ def _authenticate_request(context: Any) -> AuthorizedCaller:
 
 
 def _redact(value: str) -> str:
-    if _SECRET_TOKEN:
-        value = value.replace(_SECRET_TOKEN, "***REDACTED***")
+    for secret in sorted(_REDACTED_VALUES, key=len, reverse=True):
+        value = value.replace(secret, "***REDACTED***")
     return value
+
+
+def _passthrough_env() -> dict[str, str]:
+    # Network/TLS settings only; nothing here grants authority.
+    names = ("HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR", "TZ")
+    return {name: os.environ[name] for name in names if os.environ.get(name)}
+
+
+def _base_child_env() -> dict[str, str]:
+    """Environment for first-party diagnostics: no AWS or Drive9 credentials."""
+    return {
+        **_passthrough_env(),
+        "PATH": _CHILD_PATH,
+        "HOME": tempfile.gettempdir(),
+        "LANG": "C.UTF-8",
+    }
 
 
 def _run(
@@ -238,6 +275,7 @@ def _run(
     env: dict[str, str] | None = None,
     input_text: str | None = None,
     timeout: int = 120,
+    process_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     try:
@@ -247,8 +285,11 @@ def _run(
             text=True,
             capture_output=True,
             timeout=timeout,
-            env=env,
+            # Never fall back to inheriting os.environ: it carries the
+            # AgentCore container-credential variables.
+            env=_base_child_env() if env is None else env,
             check=False,
+            **(process_options or {}),
         )
         return {
             "command": args[0:3],
@@ -276,33 +317,123 @@ def _run(
 
 
 def _drive9_env() -> dict[str, str]:
-    env = os.environ.copy()
-    env["HOME"] = f"/tmp/drive9-home-{AGENT_ID}"
-    env["DRIVE9_SERVER"] = _SECRET_SERVER or DRIVE9_SERVER
-    # drive9 accepts bearer tokens through DRIVE9_API_KEY. This avoids passing
-    # a credential to `ctx import`, which expects a different JWT format.
-    token = _load_secret_token()
-    if token:
-        env["DRIVE9_API_KEY"] = token
-    Path(env["HOME"]).mkdir(parents=True, exist_ok=True, mode=0o700)
-    return env
+    """Explicit allowlist environment for the drive9 CLI.
+
+    The parent environment is deliberately not copied: it contains the
+    AgentCore/AWS container-credential variables, which the vendor binary has
+    no use for. The Drive9 token is not passed here either; the CLI reads it
+    from the private context file written by _write_drive9_context().
+    """
+    return {
+        **_passthrough_env(),
+        "PATH": _CHILD_PATH,
+        "HOME": str(_drive9_memory_home()),
+        "XDG_CACHE_HOME": str(_drive9_cache_dir()),
+        "TMPDIR": tempfile.gettempdir(),
+        "LANG": "C.UTF-8",
+        "DRIVE9_SERVER": _SECRET_SERVER or DRIVE9_SERVER,
+        "DRIVE9_CLI_LOG_ENABLED": "false",
+    }
 
 
-def _load_secret_token() -> str:
-    global _SECRET_TOKEN, _SECRET_SERVER
-    if _SECRET_TOKEN:
+def _drive9_memory_home() -> Path:
+    """tmpfs HOME that holds only this runtime's Drive9 context file."""
+    return DRIVE9_MEMORY_ROOT / f"drive9-home-{AGENT_ID}"
+
+
+def _drive9_cache_dir() -> Path:
+    # Keep CLI/FUSE caches off the size-limited tmpfs that holds the context.
+    return Path(tempfile.gettempdir()) / f"drive9-cache-{AGENT_ID}"
+
+
+def _ensure_private_dir(path: Path) -> None:
+    """Create or accept a 0700 directory owned by this uid; never a symlink."""
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError(f"refusing to use non-directory credential path: {path}")
+    if info.st_uid != os.geteuid():
+        raise RuntimeError(f"refusing to use credential directory owned by another user: {path}")
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        os.chmod(path, 0o700)
+
+
+def _write_drive9_context(token: str, server: str) -> None:
+    """Atomically write the Drive9 CLI context as a 0600 file on tmpfs."""
+    if not DRIVE9_MEMORY_ROOT.is_dir():
+        raise RuntimeError(f"{DRIVE9_MEMORY_ROOT} is required to hold the Drive9 context in memory")
+    home = _drive9_memory_home()
+    config_dir = home / ".drive9"
+    _ensure_private_dir(home)
+    _ensure_private_dir(config_dir)
+    cache_dir = _drive9_cache_dir()
+    _ensure_private_dir(cache_dir)
+    # The FUSE layer derives its cache from $HOME/.cache; point that at the
+    # private on-disk cache instead of filling tmpfs.
+    home_cache = home / ".cache"
+    if not os.path.lexists(home_cache):
+        os.symlink(cache_dir, home_cache)
+    elif not home_cache.is_symlink() or os.readlink(home_cache) != str(cache_dir):
+        raise RuntimeError("refusing to use an unexpected Drive9 cache path")
+    document = {
+        "server": server,
+        "current_context": AGENT_ID,
+        # The bearer token from `drive9 token issue --print` is the same
+        # credential the CLI previously took from DRIVE9_API_KEY, which it
+        # classifies as an owner-kind API key.
+        "contexts": {AGENT_ID: {"type": "owner", "server": server, "api_key": token}},
+    }
+    temporary = config_dir / f".config-{uuid.uuid4().hex}"
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(document, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, config_dir / "config")
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _remove_drive9_context() -> None:
+    try:
+        (_drive9_memory_home() / ".drive9" / "config").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+atexit.register(_remove_drive9_context)
+
+
+def _secret_is_fresh() -> bool:
+    return bool(_SECRET_TOKEN) and (
+        time.monotonic() - _SECRET_LOADED_AT < DRIVE9_SECRET_REFRESH_SECONDS
+    )
+
+
+def _load_secret_token(*, force: bool = False) -> str:
+    """Read the tenant's Drive9 token from Secrets Manager.
+
+    The cached value expires after DRIVE9_SECRET_REFRESH_SECONDS so that a
+    rotated or revoked Secret is picked up by a long-lived runtime.
+    """
+    global _SECRET_TOKEN, _SECRET_SERVER, _SECRET_LOADED_AT
+    if not force and _secret_is_fresh():
         return _SECRET_TOKEN
     if not SECRET_ID:
-        token = os.getenv("DRIVE9_TEST_TOKEN", "") or os.getenv("DRIVE9_API_KEY", "")
-        if not token:
-            raise RuntimeError("DRIVE9_SECRET_ID or DRIVE9_TEST_TOKEN is required")
-        _SECRET_TOKEN = token.strip()
-        return _SECRET_TOKEN
+        raise RuntimeError(
+            "DRIVE9_SECRET_ID is required; plaintext token environment variables are not supported"
+        )
 
     client = boto3.client("secretsmanager")
     response = client.get_secret_value(SecretId=SECRET_ID)
     value = response["SecretString"]
     parsed: Any = None
+    server = ""
     try:
         parsed = json.loads(value)
         if isinstance(parsed, dict):
@@ -310,16 +441,22 @@ def _load_secret_token() -> str:
         else:
             token = value
         if isinstance(parsed, dict) and parsed.get("server"):
-            _SECRET_SERVER = str(parsed["server"]).rstrip("/")
+            server = str(parsed["server"]).rstrip("/")
     except (json.JSONDecodeError, KeyError, TypeError):
         token = value
     if not token:
         if isinstance(parsed, dict) and ("token" in parsed or "api_key" in parsed):
             raise RuntimeError("Drive9 secret token is empty")
         raise RuntimeError("Drive9 secret JSON must contain token or api_key")
-    _SECRET_TOKEN = token.strip()
-    if not _SECRET_TOKEN:
+    token = str(token).strip()
+    if not token:
         raise RuntimeError("Drive9 token is empty")
+    if server and not re.fullmatch(r"https://[^\s/]+(/[^\s]*)?", server):
+        raise RuntimeError("Drive9 secret server must be an HTTPS URL")
+    _REDACTED_VALUES.add(token)
+    _SECRET_TOKEN = token
+    _SECRET_SERVER = server
+    _SECRET_LOADED_AT = time.monotonic()
     return _SECRET_TOKEN
 
 
@@ -353,34 +490,38 @@ def _context_names(output: str) -> list[str]:
     return names
 
 
+def _context_status() -> dict[str, Any]:
+    return {
+        "status": "ready",
+        "agent_id": AGENT_ID,
+        "context": _CONTEXT_NAME,
+        "credential_source": "tmpfs-context",
+        "server": _SECRET_SERVER or DRIVE9_SERVER,
+    }
+
+
 def _ensure_context() -> dict[str, Any]:
     global _CONTEXT_READY, _CONTEXT_NAME
     with _CONTEXT_LOCK:
-        if _CONTEXT_READY:
-            return {
-                "status": "ready",
-                "agent_id": AGENT_ID,
-                "context": _CONTEXT_NAME,
-                "credential_source": "DRIVE9_API_KEY",
-                "server": _SECRET_SERVER or DRIVE9_SERVER,
-            }
+        if _CONTEXT_READY and _secret_is_fresh():
+            return _context_status()
 
-        env = _drive9_env()
-        # A token from `drive9 token issue --print` is a bearer token, while
-        # `drive9 ctx import` consumes a serialized delegated-context JWT. Use
-        # the supported environment credential path for Runtime containers.
-        probe = _run(["drive9", "fs", "ls", BASE_REMOTE], env=env)
+        # First use, or the cached token has expired: re-read the Secret and
+        # rewrite the context so rotation and revocation take effect. A
+        # failed refresh fails closed instead of reusing the stale token.
+        _CONTEXT_READY = False
+        try:
+            token = _load_secret_token(force=True)
+        except Exception:
+            _remove_drive9_context()
+            raise
+        _write_drive9_context(token, _SECRET_SERVER or DRIVE9_SERVER)
+        probe = _run(["drive9", "fs", "ls", BASE_REMOTE], env=_drive9_env())
         if probe["exit_code"] != 0:
             raise RuntimeError(f"Drive9 credential/workspace probe failed: {probe['stderr']}")
         _CONTEXT_NAME = AGENT_ID
         _CONTEXT_READY = True
-        return {
-            "status": "ready",
-            "agent_id": AGENT_ID,
-            "context": _CONTEXT_NAME,
-            "credential_source": "DRIVE9_API_KEY",
-            "server": _SECRET_SERVER or DRIVE9_SERVER,
-        }
+        return _context_status()
 
 
 def _safe_component(value: str, field: str) -> str:
@@ -816,138 +957,128 @@ def action_mount_test(_: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-_BOOLEAN_VALUES = frozenset({"true", "false"})
-_SAFE_TEXT = re.compile(r"[^\x00-\x1f\x7f]{1,256}")
+# Git never runs against Drive9. The shared Drive9 tree (including any
+# .git/config, hooks or .gitattributes on it) is writable by every holder of
+# the A/B token, and git honours many command-executing keys from repository
+# config (core.fsmonitor, filter.*, diff.textconv, alias.*, ...). Validating
+# that config in a separate process cannot close the race with the later git
+# run. Instead, git_prepare builds the repository in a fresh private
+# directory on this tenant's own volume, runs git there as an unprivileged
+# uid, and publishes only a plain JSON snapshot. git_verify parses that JSON
+# against a fixed schema and never runs git on remote content.
+GIT_STAGING_ROOT = Path("/mnt/scratch/git-staging")
+GIT_UID = 10000
+GIT_GID = 10000
+GIT_SNAPSHOT_SCHEMA = "drive9-git-snapshot/v1"
+_GIT_SNAPSHOT_FIELDS = (
+    "schema",
+    "task_id",
+    "producer_agent",
+    "branch",
+    "head",
+    "status",
+    "log",
+    "dirty_content",
+    "created_at",
+)
+_GIT_SNAPSHOT_MAX_TEXT = 65536
 
-# Repository-local config is attacker-reachable (it lives on the shared
-# Drive9 tree), so only keys that `git init` / `git config user.*` write are
-# accepted. Every other key, including core.fsmonitor, core.hooksPath,
-# core.sshCommand, filter.*, diff.*, alias.*, include.* and extensions.*, is
-# refused before git runs.
-_ALLOWED_REPO_CONFIG: dict[str, Callable[[str], bool]] = {
-    "core.repositoryformatversion": lambda value: value == "0",
-    "core.bare": lambda value: value == "false",
-    "core.filemode": lambda value: value in _BOOLEAN_VALUES,
-    "core.logallrefupdates": lambda value: value in _BOOLEAN_VALUES,
-    "core.symlinks": lambda value: value in _BOOLEAN_VALUES,
-    "core.ignorecase": lambda value: value in _BOOLEAN_VALUES,
-    "core.precomposeunicode": lambda value: value in _BOOLEAN_VALUES,
-    "user.email": lambda value: bool(_SAFE_TEXT.fullmatch(value)),
-    "user.name": lambda value: bool(_SAFE_TEXT.fullmatch(value)),
-}
-
-# Command-line config has the highest precedence. These overrides neutralise
-# the most common command-execution keys even if the repository config is
-# swapped between validation and use.
+# Command-line config has the highest precedence. The staging repository is
+# created by this process, so nothing untrusted can set these keys; the
+# overrides are defence in depth against system/global config.
 _GIT_HARDENING = (
     "core.fsmonitor=false",
     "core.hooksPath=/dev/null",
+    "core.attributesFile=/dev/null",
     "core.pager=cat",
+    "core.editor=false",
+    "sequence.editor=false",
+    "core.sshCommand=false",
     "core.untrackedCache=false",
     "credential.helper=",
     "protocol.allow=never",
     "commit.gpgSign=false",
+    "tag.gpgSign=false",
     "submodule.recurse=false",
+    "init.templateDir=",
+    "init.defaultBranch=main",
+    "user.email=agentcore@example.invalid",
+    "user.name=AgentCore Test",
 )
-
-# git-dir entries that redirect git to configuration outside .git/config.
-_FORBIDDEN_GIT_DIR_ENTRIES = ("commondir", "config.worktree", "gitdir")
 
 
 def _git_env() -> dict[str, str]:
     """Minimal environment for git: no Drive9 token, no AWS credentials."""
-    home = Path(tempfile.gettempdir()) / f"git-home-{AGENT_ID}"
-    home.mkdir(parents=True, exist_ok=True, mode=0o700)
     return {
-        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
-        "HOME": str(home),
+        "PATH": "/usr/bin:/bin",
+        # Never read: GIT_CONFIG_GLOBAL replaces $HOME/.gitconfig.
+        "HOME": str(GIT_STAGING_ROOT),
         "LANG": "C.UTF-8",
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_ATTR_NOSYSTEM": "1",
         "GIT_TERMINAL_PROMPT": "0",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_CEILING_DIRECTORIES": str(GIT_STAGING_ROOT),
     }
 
 
-def _parse_git_config_list(output: str) -> list[tuple[str, str]]:
-    """Parse `git config --list --null` output into (key, value) pairs."""
-    entries: list[tuple[str, str]] = []
-    for record in output.split("\0"):
-        if not record:
-            continue
-        key, separator, value = record.partition("\n")
-        # A key without "=" in the file is an implicit boolean true.
-        entries.append((key, value if separator else "true"))
-    return entries
+def _git_process_options() -> dict[str, Any]:
+    """Drop to the unprivileged image user if the runtime runs as root."""
+    if os.geteuid() == 0:
+        return {"user": GIT_UID, "group": GIT_GID, "extra_groups": []}
+    return {}
 
 
-def _validate_git_config_entries(entries: list[tuple[str, str]]) -> None:
-    for key, value in entries:
-        check = _ALLOWED_REPO_CONFIG.get(key)
-        if check is None:
-            raise RuntimeError(f"refusing to run git: repository config key {key!r} is not allowed")
-        if not check(value):
-            raise RuntimeError(f"refusing to run git: repository config key {key!r} has a disallowed value")
+def _chown_for_git(path: Path) -> None:
+    if os.geteuid() == 0:
+        os.chown(path, GIT_UID, GIT_GID, follow_symlinks=False)
 
 
-def _reject_symlink(path: Path) -> None:
-    if path.is_symlink():
-        raise RuntimeError(f"refusing to use symlink in mounted workspace: {path.name}")
+def _git_staging_root() -> Path:
+    """Create or accept the tenant-local staging root; refuse symlinks."""
+    root = GIT_STAGING_ROOT
+    if root.is_symlink():
+        raise RuntimeError("refusing to use a symlinked Git staging root")
+    try:
+        os.mkdir(root, 0o700)
+    except FileExistsError:
+        pass
+    info = os.lstat(root)
+    if stat.S_ISLNK(info.st_mode):
+        raise RuntimeError("refusing to use a symlinked Git staging root")
+    if not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError("Git staging root is not a directory")
+    allowed_owners = {os.geteuid(), GIT_UID} if os.geteuid() == 0 else {os.geteuid()}
+    if info.st_uid not in allowed_owners:
+        raise RuntimeError("Git staging root is owned by another user")
+    _chown_for_git(root)
+    os.chmod(root, 0o700)
+    return root
 
 
-def _verify_git_repository(repo: Path) -> None:
-    """Check that the repository on the shared mount cannot make git run commands."""
-    git_dir = repo / ".git"
-    _reject_symlink(repo)
-    _reject_symlink(git_dir)
-    if not git_dir.is_dir():
-        # A .git *file* ("gitdir: ...") would point git at a different config.
-        raise RuntimeError("refusing to run git: .git is not a directory")
-    for name in _FORBIDDEN_GIT_DIR_ENTRIES:
-        if os.path.lexists(git_dir / name):
-            raise RuntimeError(f"refusing to run git: unexpected .git/{name}")
-    config = git_dir / "config"
-    _reject_symlink(config)
-    if not config.is_file():
-        raise RuntimeError("refusing to run git: .git/config is missing or not a regular file")
-    # Use git's own parser so validation and use cannot disagree. Reading a
-    # file with --file and --no-includes does not execute any config value.
-    listing = _run(
-        ["git", "config", "--file", str(config), "--no-includes", "--null", "--list"],
+def _run_local_git(repo: Path, *args: str, timeout: int = 60) -> dict[str, Any]:
+    """Run git against a private local repository created by this process."""
+    command = ["git"]
+    for override in _GIT_HARDENING:
+        command.extend(["-c", override])
+    # Explicit --git-dir/--work-tree disables repository discovery.
+    command.extend(["--git-dir", str(repo / ".git"), "--work-tree", str(repo), *args])
+    result = _run(
+        command,
         env=_git_env(),
-        timeout=30,
+        timeout=timeout,
+        process_options=_git_process_options(),
     )
-    if listing["exit_code"] != 0:
-        raise RuntimeError("refusing to run git: repository config could not be parsed")
-    _validate_git_config_entries(_parse_git_config_list(listing["stdout"]))
-
-
-def _git(repo: Path, *args: str, timeout: int = 60) -> dict[str, Any]:
-    """Run git against a validated repository with an explicit git-dir."""
-    _verify_git_repository(repo)
-    command = ["git"]
-    for override in _GIT_HARDENING:
-        command.extend(["-c", override])
-    # Explicit --git-dir/--work-tree disables repository discovery, so a
-    # .git planted in a parent directory is never consulted.
-    command.extend(["-C", str(repo), "--git-dir", str(repo / ".git"), "--work-tree", str(repo), *args])
-    result = _run(command, env=_git_env(), timeout=timeout)
     result["command"] = ["git", *args[:2]]
-    return result
-
-
-def _git_init(repo: Path) -> dict[str, Any]:
-    command = ["git"]
-    for override in _GIT_HARDENING:
-        command.extend(["-c", override])
-    command.extend(["init", "--", str(repo)])
-    result = _run(command, env=_git_env(), timeout=60)
-    result["command"] = ["git", "init"]
+    if result["exit_code"] != 0:
+        raise RuntimeError(f"git {args[0]} failed: {result['stderr'][-2000:]}")
     return result
 
 
 def _write_regular_file(path: Path, content: str, *, fsync: bool = False) -> None:
-    """Write a file on the mount without following a planted symlink."""
+    """Write a file without following a planted symlink."""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
@@ -958,66 +1089,98 @@ def _write_regular_file(path: Path, content: str, *, fsync: bool = False) -> Non
             os.fsync(handle.fileno())
 
 
-def _read_regular_file(path: Path) -> str:
-    """Read a file on the mount without following symlinks or blocking on FIFOs."""
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as handle:
-        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-            raise RuntimeError(f"refusing to read non-regular file: {path.name}")
-        return handle.read(MAX_RESPONSE_BYTES)
+def _git_snapshot_path(task_id: str) -> str:
+    return f"git-workspaces/{task_id}/snapshot.json"
 
 
-def _workspace_repo(mountpoint: Path, task_id: str, *, create: bool) -> Path:
-    workspaces = mountpoint / "git-workspaces"
-    repo = workspaces / task_id
-    for path in (workspaces, repo):
-        _reject_symlink(path)
-        if create:
-            path.mkdir(exist_ok=True)
-            _reject_symlink(path)
-    return repo
-
-
-def _git_snapshot(repo: Path) -> dict[str, Any]:
-    return {
-        "branch": _git(repo, "branch", "--show-current"),
-        "head": _git(repo, "rev-parse", "HEAD"),
-        "status": _git(repo, "status", "--porcelain=v1"),
-        "log": _git(repo, "log", "-1", "--oneline"),
-    }
+def _validate_git_snapshot(raw: str, task_id: str) -> dict[str, Any]:
+    """Parse a remote snapshot as data only; anything unexpected is rejected."""
+    try:
+        snapshot = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Git snapshot has an invalid schema: not JSON") from exc
+    if not isinstance(snapshot, dict) or set(snapshot) != set(_GIT_SNAPSHOT_FIELDS):
+        raise RuntimeError("Git snapshot has an invalid schema: unexpected fields")
+    if snapshot["schema"] != GIT_SNAPSHOT_SCHEMA:
+        raise RuntimeError("Git snapshot has an invalid schema: unknown version")
+    for field in _GIT_SNAPSHOT_FIELDS:
+        if field == "created_at":
+            continue
+        value = snapshot[field]
+        if not isinstance(value, str) or len(value) > _GIT_SNAPSHOT_MAX_TEXT:
+            raise RuntimeError(f"Git snapshot has an invalid schema: bad {field}")
+    if not isinstance(snapshot["created_at"], (int, float)) or isinstance(snapshot["created_at"], bool):
+        raise RuntimeError("Git snapshot has an invalid schema: bad created_at")
+    if snapshot["task_id"] != task_id:
+        raise RuntimeError("Git snapshot has an invalid schema: task_id mismatch")
+    if snapshot["producer_agent"] not in ISOLATION_POLICY:
+        raise RuntimeError("Git snapshot has an invalid schema: unknown producer_agent")
+    if snapshot["branch"] != f"feature/{task_id}":
+        raise RuntimeError("Git snapshot has an invalid schema: unexpected branch")
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", snapshot["head"]):
+        raise RuntimeError("Git snapshot has an invalid schema: bad head")
+    return snapshot
 
 
 def action_git_prepare(payload: dict[str, Any]) -> dict[str, Any]:
     task_id = _safe_component(str(payload.get("task_id", "git-001")), "task_id")
-
-    def callback(mountpoint: Path) -> dict[str, Any]:
-        repo = _workspace_repo(mountpoint, task_id, create=True)
-        if not os.path.lexists(repo / ".git"):
-            _git_init(repo)
-            _git(repo, "config", "user.email", "agentcore@example.invalid")
-            _git(repo, "config", "user.name", "AgentCore Test")
-            _write_regular_file(repo / "README.md", "# Drive9 Git workspace test\n")
-            _git(repo, "add", "--", "README.md")
-            _git(repo, "commit", "-m", "base commit")
-        _git(repo, "checkout", "-B", f"feature/{task_id}")
-        _write_regular_file(repo / "dirty.txt", f"uncommitted work from {AGENT_ID}\n")
-        return _git_snapshot(repo)
-
-    return _mounted(callback)
+    root = _git_staging_root()
+    repo = Path(tempfile.mkdtemp(prefix=f"{task_id}-", dir=root))
+    try:
+        _chown_for_git(repo)
+        _run_local_git(repo, "init", "--quiet")
+        _write_regular_file(repo / "README.md", "# Drive9 Git workspace test\n")
+        _run_local_git(repo, "add", "--", "README.md")
+        _run_local_git(repo, "commit", "--quiet", "--no-verify", "-m", "base commit")
+        _run_local_git(repo, "checkout", "--quiet", "-B", f"feature/{task_id}")
+        dirty_content = f"uncommitted work from {AGENT_ID}\n"
+        _write_regular_file(repo / "dirty.txt", dirty_content)
+        snapshot = {
+            "schema": GIT_SNAPSHOT_SCHEMA,
+            "task_id": task_id,
+            "producer_agent": AGENT_ID,
+            "branch": _run_local_git(repo, "branch", "--show-current")["stdout"].strip(),
+            "head": _run_local_git(repo, "rev-parse", "HEAD")["stdout"].strip(),
+            "status": _run_local_git(repo, "status", "--porcelain=v1")["stdout"],
+            "log": _run_local_git(repo, "log", "-1", "--oneline")["stdout"].strip(),
+            "dirty_content": dirty_content,
+            "created_at": time.time(),
+        }
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+    snapshot_path = _git_snapshot_path(task_id)
+    publish = _write_text(snapshot_path, json.dumps(snapshot, ensure_ascii=False, indent=2))
+    return {
+        "status": "PASS" if publish["exit_code"] == 0 else "FAIL",
+        "execution": "tenant-local-unprivileged",
+        "snapshot_path": snapshot_path,
+        "snapshot": snapshot,
+        "publish": publish,
+    }
 
 
 def action_git_verify(payload: dict[str, Any]) -> dict[str, Any]:
     task_id = _safe_component(str(payload.get("task_id", "git-001")), "task_id")
-
-    def callback(mountpoint: Path) -> dict[str, Any]:
-        repo = _workspace_repo(mountpoint, task_id, create=False)
-        if not os.path.lexists(repo / ".git"):
-            raise RuntimeError("Git workspace was not found")
-        snapshot = _git_snapshot(repo)
-        snapshot["dirty_content"] = _read_regular_file(repo / "dirty.txt")
-        return snapshot
-
-    return _mounted(callback)
+    snapshot_path = _git_snapshot_path(task_id)
+    source = _read_text(snapshot_path)
+    if source["exit_code"] != 0:
+        return {
+            "status": "FAIL",
+            "execution": "no-git-on-remote-content",
+            "snapshot_path": snapshot_path,
+            "read_snapshot": source,
+        }
+    snapshot = _validate_git_snapshot(source["stdout"], task_id)
+    return {
+        "status": "PASS",
+        "execution": "no-git-on-remote-content",
+        "snapshot_path": snapshot_path,
+        "source_agent": snapshot["producer_agent"],
+        "branch": snapshot["branch"],
+        "head": snapshot["head"],
+        "status_porcelain": snapshot["status"],
+        "dirty_content": snapshot["dirty_content"],
+    }
 
 
 ACTIONS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {

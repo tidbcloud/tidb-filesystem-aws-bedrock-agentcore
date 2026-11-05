@@ -25,6 +25,13 @@ try:
 except ImportError:  # The CLI-only path does not require boto3 on the host.
     boto3 = None  # type: ignore[assignment]
 
+from deployment_tenancy import (
+    AGENT_IDS,
+    TenantResources,
+    load_tenant_resources,
+    validate_secret_access_decisions,
+)
+
 
 def required(name: str) -> str:
     value = os.getenv(name, "").strip()
@@ -40,7 +47,6 @@ def csv_env(name: str) -> list[str]:
 REGION = os.getenv("AWS_REGION", "us-east-2").strip()
 IMAGE_URI = required("IMAGE_URI")
 OPERATOR_ROLE_ARN = required("CAPACITY_PROVIDER_OPERATOR_ROLE_ARN")
-RUNTIME_ROLE_ARN = required("AGENT_RUNTIME_ROLE_ARN")
 SUBNETS = [value.strip() for value in required("SUBNET_IDS").split(",") if value.strip()]
 SECURITY_GROUPS = [value.strip() for value in required("SECURITY_GROUP_IDS").split(",") if value.strip()]
 TEST_RUN_ID = required("TEST_RUN_ID")
@@ -48,7 +54,6 @@ INSTANCE_TYPE = os.getenv("INSTANCE_TYPE", "c6g.large").strip()
 OPERATING_SYSTEM = os.getenv("OPERATING_SYSTEM", "LINUX_ARM64").strip().upper()
 ARCHITECTURE = "arm64"
 CAPACITY_PROVIDER_NAME = os.getenv("CAPACITY_PROVIDER_NAME", "drive9_arm64_cp").strip()
-VOLUME_NAME = os.getenv("CAPACITY_PROVIDER_VOLUME_NAME", "scratch").strip()
 VOLUME_SIZE_GIB = int(os.getenv("CAPACITY_PROVIDER_VOLUME_SIZE_GIB", "20"))
 PROVIDER_MAX_LIFETIME = int(os.getenv("PROVIDER_MAX_LIFETIME", "3600"))
 PROVIDER_IDLE_TIMEOUT = int(os.getenv("PROVIDER_IDLE_TIMEOUT", "900"))
@@ -95,8 +100,17 @@ if VOLUME_SIZE_GIB <= 0:
     raise RuntimeError("CAPACITY_PROVIDER_VOLUME_SIZE_GIB must be positive")
 if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,47}", CAPACITY_PROVIDER_NAME):
     raise RuntimeError("CAPACITY_PROVIDER_NAME must match [A-Za-z][A-Za-z0-9_]{0,47}")
-if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,47}", VOLUME_NAME):
-    raise RuntimeError("CAPACITY_PROVIDER_VOLUME_NAME must be a valid AgentCore volume name")
+for _legacy in ("AGENT_RUNTIME_ROLE_ARN", "CAPACITY_PROVIDER_VOLUME_NAME"):
+    if os.getenv(_legacy, "").strip():
+        raise RuntimeError(
+            f"{_legacy} is no longer supported because it shares one resource between tenants; "
+            f"set {_legacy}_AGENT_A, {_legacy}_AGENT_B and {_legacy}_AGENT_C instead"
+        )
+# Per-tenant execution role, EBS volume and Secret. Missing or duplicated
+# bindings fail here, before any AWS call.
+TENANTS: dict[str, TenantResources] = load_tenant_resources(
+    secret_prefix=SECRET_PREFIX, test_run_id=TEST_RUN_ID
+)
 if CONTROL_METHOD_REQUESTED not in {"auto", "sdk", "cli"}:
     raise RuntimeError("AGENTCORE_CONTROL_METHOD must be auto, sdk, or cli")
 if not re.fullmatch(r"https://.+/\.well-known/openid-configuration", AUTHZ_DISCOVERY_URL):
@@ -215,12 +229,62 @@ def _client_token(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex}-{uuid.uuid4().hex}"[:256]
 
 
-def _secret_id(agent_id: str) -> str:
-    env_name = f"DRIVE9_SECRET_ID_{agent_id.replace('-', '_').upper()}"
-    # Each deployment gets its own short-lived tokens. Keeping the run ID in
-    # the default secret names prevents a later deployment from silently
-    # consuming credentials created for an earlier validation run.
-    return os.getenv(env_name, f"{SECRET_PREFIX}/{TEST_RUN_ID}-{agent_id}").strip()
+def _aws_call(service: str, operation: str, **kwargs: Any) -> dict[str, Any]:
+    """Call a non-AgentCore AWS API through boto3 when present, else the CLI."""
+    if boto3 is not None:
+        return getattr(boto3.client(service, region_name=REGION), operation)(**kwargs)
+    command = [AWS_CLI, service, _camel_to_kebab(operation)]
+    command.extend(["--cli-input-json", json.dumps(kwargs, separators=(",", ":"))])
+    command.extend(["--region", REGION, "--output", "json", "--no-cli-pager"])
+    result = subprocess.run(command, text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        raise RuntimeError(f"AWS CLI {service} {operation} failed: {detail[-4000:]}")
+    value = json.loads(result.stdout or "{}")
+    if not isinstance(value, dict):
+        raise RuntimeError(f"AWS CLI {service} {operation} returned a non-object response")
+    return value
+
+
+def _verify_tenant_secret_isolation(tenants: dict[str, TenantResources]) -> dict[str, str]:
+    """Fail unless each tenant role can read its own Secret and no other.
+
+    Secret IDs are resolved to ARNs first so that two different IDs that name
+    the same Secret are caught. Decisions come from iam:SimulatePrincipalPolicy
+    against each role's identity policies.
+    """
+    secret_arns: dict[str, str] = {}
+    for agent_id, tenant in tenants.items():
+        described = _aws_call("secretsmanager", "describe_secret", SecretId=tenant.secret_id)
+        arn = described.get("ARN")
+        if not isinstance(arn, str) or not arn.startswith("arn:"):
+            raise RuntimeError(f"could not resolve the Drive9 Secret ARN for {agent_id}")
+        secret_arns[agent_id] = arn
+
+    decisions: dict[tuple[str, str], str] = {}
+    for tenant in tenants.values():
+        marker: str | None = None
+        while True:
+            request: dict[str, Any] = {
+                "PolicySourceArn": tenant.runtime_role_arn,
+                "ActionNames": ["secretsmanager:GetSecretValue"],
+                "ResourceArns": list(secret_arns.values()),
+            }
+            if marker:
+                request["Marker"] = marker
+            response = _aws_call("iam", "simulate_principal_policy", **request)
+            for item in response.get("EvaluationResults", []):
+                resource = item.get("EvalResourceName")
+                decision = item.get("EvalDecision")
+                if isinstance(resource, str) and isinstance(decision, str):
+                    decisions[(tenant.runtime_role_arn, resource)] = decision
+            if not response.get("IsTruncated"):
+                break
+            marker = response.get("Marker")
+
+    validate_secret_access_decisions(tenants, secret_arns, decisions)
+    print("tenant Secret isolation verified with iam:SimulatePrincipalPolicy", flush=True)
+    return secret_arns
 
 
 def _authorizer_configuration() -> dict[str, Any]:
@@ -271,6 +335,9 @@ def main() -> None:
 
     capacity_provider_id = ""
     created_runtime_ids: list[str] = []
+    # Runs before any resource is created: a shared or over-broad runtime
+    # role aborts the deployment instead of producing a non-isolated one.
+    secret_arns = _verify_tenant_secret_isolation(TENANTS)
     try:
         capacity = _call(
             "create_capacity_provider",
@@ -298,14 +365,16 @@ def main() -> None:
                         "subnets": SUBNETS,
                         "securityGroups": SECURITY_GROUPS,
                     },
+                    # One EBS volume per tenant; each runtime mounts only its own.
                     "volumes": [
                         {
                             "ebsConfiguration": {
-                                "name": VOLUME_NAME,
+                                "name": TENANTS[agent_id].volume_name,
                                 "sizeGiB": VOLUME_SIZE_GIB,
                                 "volumeType": "gp3",
                             }
                         }
+                        for agent_id in AGENT_IDS
                     ],
                     "lifecycleConfiguration": {
                         "idleInstanceTimeout": PROVIDER_IDLE_TIMEOUT,
@@ -326,11 +395,12 @@ def main() -> None:
         ]
         runtime_results: dict[str, dict[str, Any]] = {}
         for runtime_name, agent_id in agent_specs:
+            tenant = TENANTS[agent_id]
             response = _call(
                 "create_agent_runtime",
                 agentRuntimeName=runtime_name,
                 description=f"Drive9 validation runtime for {agent_id}",
-                roleArn=RUNTIME_ROLE_ARN,
+                roleArn=tenant.runtime_role_arn,
                 authorizerConfiguration=_authorizer_configuration(),
                 requestHeaderConfiguration={"requestHeaderAllowlist": ["Authorization"]},
                 clientToken=_client_token(f"create-{agent_id}"),
@@ -345,7 +415,7 @@ def main() -> None:
                 filesystemConfigurations=[
                     {
                         "capacityProviderVolume": {
-                            "volumeName": VOLUME_NAME,
+                            "volumeName": tenant.volume_name,
                             "mountPath": "/mnt/scratch",
                         }
                     }
@@ -357,7 +427,7 @@ def main() -> None:
                 protocolConfiguration={"serverProtocol": "HTTP"},
                 environmentVariables={
                     "AGENT_ID": agent_id,
-                    "DRIVE9_SECRET_ID": _secret_id(agent_id),
+                    "DRIVE9_SECRET_ID": tenant.secret_id,
                     "DRIVE9_SERVER": DRIVE9_SERVER,
                     "DRIVE9_SHARED_BASE_REMOTE": DRIVE9_SHARED_BASE_REMOTE,
                     "DRIVE9_AGENT_C_BASE_REMOTE": DRIVE9_AGENT_C_BASE_REMOTE,
@@ -385,7 +455,10 @@ def main() -> None:
                 "agent_runtime_id": ready["agentRuntimeId"],
                 "agent_runtime_arn": ready["agentRuntimeArn"],
                 "version": ready["agentRuntimeVersion"],
-                "secret_id": _secret_id(agent_id),
+                "secret_id": tenant.secret_id,
+                "secret_arn": secret_arns[agent_id],
+                "runtime_role_arn": tenant.runtime_role_arn,
+                "capacity_provider_volume": tenant.volume_name,
             }
 
         deployment = {
@@ -413,7 +486,6 @@ def main() -> None:
             "control_method": CONTROL_METHOD,
             "capacity_provider_id": capacity_provider_id,
             "capacity_provider_arn": capacity_provider_arn,
-            "capacity_provider_volume": VOLUME_NAME,
             "runtimes": runtime_results,
         }
         Path("deployment.json").write_text(json.dumps(deployment, indent=2) + "\n", encoding="utf-8")
